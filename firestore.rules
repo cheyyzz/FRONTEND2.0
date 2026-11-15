@@ -1,0 +1,295 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: default deny everything
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isStudent(uid) {
+      return isOwner(uid)
+        && exists(/databases/$(database)/documents/users/$(uid))
+        && get(/databases/$(database)/documents/users/$(uid)).data.role == 'student';
+    }
+
+    function isValidClassCode(code) {
+      return code is string && code.matches('^[A-HJ-NP-Z2-9]{8}$');
+    }
+
+    function isBootstrappedAdmin() {
+      return isSignedIn()
+        && request.auth.token.email == '12410394@student.unklab.ac.id'
+        && request.auth.token.email_verified == true;
+    }
+
+    function isTeacher() {
+      return isBootstrappedAdmin()
+        || (
+          isSignedIn()
+          && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'teacher'
+        );
+    }
+
+    function isClassTeacher(classCode) {
+      return isTeacher()
+        && exists(/databases/$(database)/documents/classes/$(classCode))
+        && get(/databases/$(database)/documents/classes/$(classCode)).data.teacherId == request.auth.uid;
+    }
+
+    function isQuizOwner(quizId) {
+      return isTeacher()
+        && exists(/databases/$(database)/documents/quizzes/$(quizId))
+        && get(/databases/$(database)/documents/quizzes/$(quizId)).data.createdBy == request.auth.uid;
+    }
+
+    function isCreatingQuiz(quizId) {
+      return isTeacher()
+        && !exists(/databases/$(database)/documents/quizzes/$(quizId))
+        && getAfter(/databases/$(database)/documents/quizzes/$(quizId)).data.createdBy == request.auth.uid;
+    }
+
+    function isPublishedQuiz(quizId) {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/quizzes/$(quizId))
+        && get(/databases/$(database)/documents/quizzes/$(quizId)).data.isPublished == true;
+    }
+
+    function hasSubmittedQuiz(quizId, studentId) {
+      return isStudent(studentId)
+        && exists(/databases/$(database)/documents/quizzes/$(quizId)/attempts/$(studentId))
+        && get(/databases/$(database)/documents/quizzes/$(quizId)/attempts/$(studentId)).data.studentId == studentId;
+    }
+
+    function isValidUserPayload(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'masteryByTopic', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'masteryByTopic', 'createdAt', 'updatedAt'])
+        && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 160
+        && data.displayName is string && data.displayName.size() >= 2 && data.displayName.size() <= 80
+        && data.role in ['student', 'teacher']
+        && data.masteryByTopic is map;
+    }
+
+    // Boot connectivity probe document (non-PII, read-only single doc)
+    match /test/connection {
+      allow get: if true;
+      allow list, write: if false;
+    }
+
+    // Users collection: strict PII isolation and anti-escalation role protection
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId)
+        && isOwner(userId)
+        && isValidUserPayload(incoming())
+        && incoming().uid == request.auth.uid
+        && (incoming().role == 'student' || (isBootstrappedAdmin() && incoming().role == 'teacher'))
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isSignedIn()
+        && isValidUserPayload(incoming())
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (
+            isOwner(userId)
+            && incoming().role == existing().role
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'masteryByTopic', 'updatedAt'])
+          )
+          || isBootstrappedAdmin()
+        );
+      allow delete: if false;
+
+      match /classes/{classCode} {
+        allow get, list: if isOwner(userId);
+        allow create: if isStudent(userId)
+          && isValidClassCode(classCode)
+          && incoming().keys().hasAll(['classCode', 'className', 'teacherId', 'teacherName', 'joinedAt'])
+          && incoming().keys().hasOnly(['classCode', 'className', 'teacherId', 'teacherName', 'joinedAt'])
+          && incoming().classCode == classCode
+          && incoming().className is string
+          && incoming().teacherId is string
+          && incoming().teacherName is string
+          && incoming().joinedAt == request.time
+          && exists(/databases/$(database)/documents/classes/$(classCode))
+          && get(/databases/$(database)/documents/classes/$(classCode)).data.name == incoming().className
+          && get(/databases/$(database)/documents/classes/$(classCode)).data.teacherId == incoming().teacherId
+          && get(/databases/$(database)/documents/classes/$(classCode)).data.teacherName == incoming().teacherName
+          && getAfter(/databases/$(database)/documents/classes/$(classCode)/students/$(userId)).data.uid == userId
+          && getAfter(/databases/$(database)/documents/classes/$(classCode)/students/$(userId)).data.displayName
+            == get(/databases/$(database)/documents/users/$(userId)).data.displayName;
+        allow update, delete: if false;
+      }
+    }
+
+    match /classes/{classCode} {
+      allow get: if isSignedIn() && isValidClassCode(classCode);
+      allow list: if isTeacher() && resource.data.teacherId == request.auth.uid;
+      allow create: if isTeacher()
+        && isValidClassCode(classCode)
+        && incoming().keys().hasAll(['name', 'teacherId', 'teacherName', 'createdAt'])
+        && incoming().keys().hasOnly(['name', 'teacherId', 'teacherName', 'createdAt'])
+        && incoming().name is string
+        && incoming().name.size() >= 2
+        && incoming().name.size() <= 80
+        && incoming().teacherId == request.auth.uid
+        && incoming().teacherName == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.displayName
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
+
+      match /students/{studentId} {
+        allow get: if (isSignedIn() && studentId == request.auth.uid) || isClassTeacher(classCode);
+        allow list: if isClassTeacher(classCode);
+        allow create: if isStudent(studentId)
+          && request.resource.data.keys().hasAll(['uid', 'displayName', 'joinedAt'])
+          && request.resource.data.keys().hasOnly(['uid', 'displayName', 'joinedAt'])
+          && request.resource.data.uid == studentId
+          && request.resource.data.displayName
+            == get(/databases/$(database)/documents/users/$(studentId)).data.displayName
+          && request.resource.data.joinedAt == request.time
+          && isValidClassCode(classCode)
+          && exists(/databases/$(database)/documents/classes/$(classCode))
+          && getAfter(/databases/$(database)/documents/users/$(studentId)/classes/$(classCode)).data.classCode
+            == classCode
+          && getAfter(/databases/$(database)/documents/users/$(studentId)/classes/$(classCode)).data.className
+            == get(/databases/$(database)/documents/classes/$(classCode)).data.name
+          && getAfter(/databases/$(database)/documents/users/$(studentId)/classes/$(classCode)).data.teacherId
+            == get(/databases/$(database)/documents/classes/$(classCode)).data.teacherId
+          && getAfter(/databases/$(database)/documents/users/$(studentId)/classes/$(classCode)).data.teacherName
+            == get(/databases/$(database)/documents/classes/$(classCode)).data.teacherName;
+        allow update, delete: if false;
+      }
+    }
+
+    match /quizzes/{quizId} {
+      allow get: if isQuizOwner(quizId) || (isSignedIn() && resource.data.isPublished == true);
+      allow list: if (isTeacher() && resource.data.createdBy == request.auth.uid)
+        || (isStudent(request.auth.uid) && resource.data.isPublished == true);
+      allow create: if isTeacher()
+        && request.resource.data.keys().hasAll([
+          'title', 'description', 'subject', 'topic', 'subtopic', 'difficulty', 'sourceType',
+          'createdBy', 'creatorRole', 'isPublished', 'questionCount', 'verifiedCount',
+          'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'title', 'description', 'subject', 'topic', 'subtopic', 'difficulty', 'sourceType',
+          'createdBy', 'creatorRole', 'isPublished', 'questionCount', 'verifiedCount',
+          'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.title is string
+        && request.resource.data.title.size() >= 2
+        && request.resource.data.title.size() <= 100
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 500
+        && request.resource.data.subject is string
+        && request.resource.data.subject.size() >= 2
+        && request.resource.data.subject.size() <= 80
+        && request.resource.data.topic is string
+        && request.resource.data.topic.size() >= 2
+        && request.resource.data.topic.size() <= 100
+        && request.resource.data.subtopic == request.resource.data.topic
+        && request.resource.data.difficulty == 'medium'
+        && request.resource.data.sourceType == 'manual'
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.creatorRole == 'teacher'
+        && request.resource.data.isPublished == true
+        && request.resource.data.questionCount is int
+        && request.resource.data.questionCount >= 1
+        && request.resource.data.questionCount <= 20
+        && request.resource.data.verifiedCount == 0
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+      allow update, delete: if false;
+
+      match /questions/{questionId} {
+        allow get, list: if isQuizOwner(quizId) || isPublishedQuiz(quizId);
+        allow create: if isCreatingQuiz(quizId)
+          && request.resource.data.keys().hasAll(['quizId', 'stem', 'options', 'order'])
+          && request.resource.data.keys().hasOnly(['quizId', 'stem', 'options', 'order'])
+          && request.resource.data.quizId == quizId
+          && request.resource.data.stem is string
+          && request.resource.data.stem.size() >= 5
+          && request.resource.data.stem.size() <= 1000
+          && request.resource.data.options is list
+          && request.resource.data.options.size() == 4
+          && request.resource.data.options[0] is string
+          && request.resource.data.options[0].size() >= 1
+          && request.resource.data.options[0].size() <= 200
+          && request.resource.data.options[1] is string
+          && request.resource.data.options[1].size() >= 1
+          && request.resource.data.options[1].size() <= 200
+          && request.resource.data.options[2] is string
+          && request.resource.data.options[2].size() >= 1
+          && request.resource.data.options[2].size() <= 200
+          && request.resource.data.options[3] is string
+          && request.resource.data.options[3].size() >= 1
+          && request.resource.data.options[3].size() <= 200
+          && request.resource.data.order is int
+          && request.resource.data.order >= 0
+          && request.resource.data.order < getAfter(/databases/$(database)/documents/quizzes/$(quizId)).data.questionCount;
+        allow update, delete: if false;
+      }
+
+      match /answerKeys/{questionId} {
+        allow get, list: if isQuizOwner(quizId)
+          || (isPublishedQuiz(quizId) && hasSubmittedQuiz(quizId, request.auth.uid));
+        allow create: if isCreatingQuiz(quizId)
+          && request.resource.data.keys().hasAll(['quizId', 'correctIndex', 'explanation'])
+          && request.resource.data.keys().hasOnly(['quizId', 'correctIndex', 'explanation'])
+          && request.resource.data.quizId == quizId
+          && request.resource.data.correctIndex is int
+          && request.resource.data.correctIndex in [0, 1, 2, 3]
+          && request.resource.data.explanation is string
+          && request.resource.data.explanation.size() <= 1000;
+        allow update, delete: if false;
+      }
+
+      match /attempts/{studentId} {
+        allow get: if studentId == request.auth.uid || isQuizOwner(quizId);
+        allow list: if isQuizOwner(quizId);
+        allow create: if isStudent(studentId)
+          && isPublishedQuiz(quizId)
+          && request.resource.data.keys().hasAll([
+            'quizId', 'studentId', 'selectedAnswers', 'questionCount', 'submittedAt'
+          ])
+          && request.resource.data.keys().hasOnly([
+            'quizId', 'studentId', 'selectedAnswers', 'questionCount', 'submittedAt'
+          ])
+          && request.resource.data.quizId == quizId
+          && request.resource.data.studentId == studentId
+          && request.resource.data.selectedAnswers is map
+          && request.resource.data.selectedAnswers.keys().size()
+            == get(/databases/$(database)/documents/quizzes/$(quizId)).data.questionCount
+          && request.resource.data.questionCount
+            == get(/databases/$(database)/documents/quizzes/$(quizId)).data.questionCount
+          && request.resource.data.submittedAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+
+  }
+}

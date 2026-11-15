@@ -1,0 +1,51 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Authenticated platform user profile with RBAC role and topic mastery map.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "role": {
+          "type": "string",
+          "enum": ["student", "teacher"]
+        },
+        "masteryByTopic": {
+          "type": "object",
+          "description": "Map of topic key to TopicMastery stats"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "displayName", "role", "masteryByTopic", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User profiles containing role (student/teacher) and adaptive topic mastery records."
+    }
+  }
+}
